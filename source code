@@ -1,0 +1,182 @@
+# ===============================
+# 1. IMPORT LIBRARIES
+# ===============================
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.linear_model import LogisticRegression
+
+from scipy.stats import ttest_rel
+
+import xgboost as xgb
+import shap
+
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Input, Multiply
+from tensorflow.keras.optimizers import Adam
+
+# ===============================
+# 2. LOAD DATASET
+# ===============================
+data = pd.read_csv("bigmart.csv")
+
+# Target column (adjust if needed)
+target = "Item_Outlet_Sales"
+
+# ===============================
+# 3. PREPROCESSING
+# ===============================
+# Fill missing values
+data = data.fillna(method='ffill')
+
+# Encode categorical variables
+le = LabelEncoder()
+for col in data.select_dtypes(include=['object']).columns:
+    data[col] = le.fit_transform(data[col])
+
+# Split features and target
+X = data.drop(columns=[target])
+y = data[target]
+
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+# Scale data for ANN
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# ===============================
+# 4. MODEL 1: XGBOOST
+# ===============================
+xgb_model = xgb.XGBRegressor(
+    n_estimators=200,
+    learning_rate=0.05,
+    max_depth=5,
+    random_state=42
+)
+
+xgb_model.fit(X_train, y_train)
+xgb_pred = xgb_model.predict(X_test)
+
+# ===============================
+# 5. MODEL 2: ANN WITH ATTENTION
+# ===============================
+input_layer = Input(shape=(X_train_scaled.shape[1],))
+
+# Attention mechanism (feature weighting)
+attention = Dense(X_train_scaled.shape[1], activation='softmax')(input_layer)
+attention_mul = Multiply()([input_layer, attention])
+
+# Hidden layers
+dense1 = Dense(128, activation='relu')(attention_mul)
+dense2 = Dense(64, activation='relu')(dense1)
+output = Dense(1)(dense2)
+
+ann_model = Model(inputs=input_layer, outputs=output)
+
+ann_model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+
+ann_model.fit(
+    X_train_scaled, y_train,
+    epochs=50,
+    batch_size=32,
+    verbose=0
+)
+
+ann_pred = ann_model.predict(X_test_scaled).flatten()
+
+# ===============================
+# 6. BASELINE: LOGISTIC REGRESSION
+# (Converted to classification proxy)
+# ===============================
+# Convert regression target to binary classification
+y_train_bin = (y_train > y_train.mean()).astype(int)
+y_test_bin = (y_test > y_test.mean()).astype(int)
+
+log_model = LogisticRegression(max_iter=500)
+log_model.fit(X_train, y_train_bin)
+
+log_pred = log_model.predict(X_test)
+
+# ===============================
+# 7. HYBRID STACKING (XGB + ANN)
+# ===============================
+# Feature-level fusion
+fusion_train = np.column_stack((
+    xgb_model.predict(X_train),
+    ann_model.predict(X_train_scaled).flatten()
+))
+
+fusion_test = np.column_stack((xgb_pred, ann_pred))
+
+# Meta-learner (XGB)
+meta_model = xgb.XGBRegressor()
+meta_model.fit(fusion_train, y_train)
+
+hybrid_pred = meta_model.predict(fusion_test)
+
+# ===============================
+# 8. EVALUATION FUNCTION
+# ===============================
+def evaluate_model(y_true, y_pred, name):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    print(f"{name} -> RMSE: {rmse:.4f}, R2: {r2:.4f}")
+    return rmse
+
+print("\n=== MODEL PERFORMANCE ===")
+rmse_xgb = evaluate_model(y_test, xgb_pred, "XGBoost")
+rmse_ann = evaluate_model(y_test, ann_pred, "ANN-Attention")
+rmse_hybrid = evaluate_model(y_test, hybrid_pred, "Hybrid XGB+ANN")
+
+# Logistic accuracy
+log_acc = (log_pred == y_test_bin).mean()
+print(f"Logistic Regression Accuracy: {log_acc:.4f}")
+
+# ===============================
+# 9. SHAP INTERPRETABILITY
+# ===============================
+print("\n=== SHAP INTERPRETABILITY ===")
+
+explainer = shap.Explainer(xgb_model, X_train)
+shap_values = explainer(X_test)
+
+# Summary plot
+shap.summary_plot(shap_values, X_test)
+
+# ===============================
+# 10. STATISTICAL SIGNIFICANCE TEST
+# ===============================
+print("\n=== PAIRED T-TEST ===")
+
+# Errors
+err_xgb = abs(y_test - xgb_pred)
+err_ann = abs(y_test - ann_pred)
+err_hybrid = abs(y_test - hybrid_pred)
+
+# Pairwise tests
+t_xgb_ann = ttest_rel(err_xgb, err_ann)
+t_xgb_hybrid = ttest_rel(err_xgb, err_hybrid)
+t_ann_hybrid = ttest_rel(err_ann, err_hybrid)
+
+print(f"XGB vs ANN: p-value = {t_xgb_ann.pvalue:.5f}")
+print(f"XGB vs Hybrid: p-value = {t_xgb_hybrid.pvalue:.5f}")
+print(f"ANN vs Hybrid: p-value = {t_ann_hybrid.pvalue:.5f}")
+
+# ===============================
+# 11. RESULT INTERPRETATION
+# ===============================
+def interpret(p):
+    return "Significant" if p < 0.05 else "Not Significant"
+
+print("\n=== SIGNIFICANCE INTERPRETATION ===")
+print("XGB vs ANN:", interpret(t_xgb_ann.pvalue))
+print("XGB vs Hybrid:", interpret(t_xgb_hybrid.pvalue))
+print("ANN vs Hybrid:", interpret(t_ann_hybrid.pvalue))
